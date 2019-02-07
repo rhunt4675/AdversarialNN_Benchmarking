@@ -1,14 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 import tensorflow as tf
 import numpy as np
 import imageio
 import models
 import json
+import time
 import os
 
 from cleverhans.attacks import FastGradientMethod, BasicIterativeMethod, MomentumIterativeMethod, \
-        SaliencyMapMethod, VirtualAdversarialMethod, CarliniWagnerL2, ElasticNetMethod, DeepFool, \
-        MadryEtAl, SPSA
+        SaliencyMapMethod, MadryEtAl, LBFGS
 from cleverhans.model import CallableModelWrapper
 slim = tf.contrib.slim
 
@@ -17,10 +17,11 @@ tf.flags.DEFINE_string('checkpoint_path', '', 'Path to checkpoint for ResNet net
 tf.flags.DEFINE_string('input_dir', '', 'Input directory with images.')
 tf.flags.DEFINE_string('output_dir', '', 'Output directory with images.')
 tf.flags.DEFINE_string('model_arch', 'resnet_v2_101', 'Model architecture to use: (resnet_v2_101/inception_v3)')
-tf.flags.DEFINE_string('attack_type', 'FGSM', 'Cleverhans attack to run: (FGSM/BIM/MIM/JSMA/VAM/CWL2/ENM/DF/MADRY/SPSA).')
+tf.flags.DEFINE_string('attack_type', 'FGSM', 'Cleverhans attack to run: (FGSM/BIM/MIM/PGD/JSMA/LBFGS).')
 tf.flags.DEFINE_integer('image_width', 224, 'Width of each input images.')
 tf.flags.DEFINE_integer('image_height', 224, 'Height of each input images.')
 tf.flags.DEFINE_integer('batch_size', 16, 'How many images process at one time.')
+tf.flags.DEFINE_boolean('show_predictions', False, '[Debug] Print model predictions of clean and adversarial images.')
 FLAGS = tf.flags.FLAGS
 
 def load_images(input_dir, batch_shape):
@@ -35,44 +36,6 @@ def load_images(input_dir, batch_shape):
     images: array with all images from this batch
   """
 
-  """images = np.zeros(batch_shape)
-  filenames = []
-  idx = 0
-
-  batch_size = batch_shape[0]
-  height = batch_shape[1]
-  width = batch_shape[2]
-
-  jpegs = tf.train.match_filenames_once(os.path.join(input_dir, '*.jpg'))
-  num_images = tf.size(jpegs)
-  filename_queue = tf.train.string_input_producer(jpegs)
-  image_reader = tf.WholeFileReader()
-
-  with tf.Session() as sess:
-    sess.run((tf.local_variables_initializer(), tf.global_variables_initializer()))
-    coord = tf.train.Coordinator()
-    threads = tf.train.start_queue_runners(sess=sess, coord=coord)
-
-    for i in range(sess.run(num_images)):
-      file_name, image_file = image_reader.read(filename_queue)
-      image = tf.image.decode_jpeg(image_file)
-
-      image_tensor = inception_preprocessing.preprocess_image(image, height, width)
-      images[idx, :, :, :] = sess.run(image_tensor)
-      filenames.append(os.path.basename(sess.run(file_name).decode('UTF-8')))
-
-      idx += 1
-      if idx == batch_size:
-        yield filenames, images
-        filenames = []
-        images = np.zeros(batch_shape)
-        idx = 0
-
-    coord.request_stop()
-    coord.join(threads)
-  if idx > 0:
-    yield filenames, images"""
-
   height = batch_shape[1]
   width = batch_shape[2]
   images = np.zeros(batch_shape)
@@ -84,14 +47,15 @@ def load_images(input_dir, batch_shape):
   with tf.Session() as sess:
     sess.run((tf.local_variables_initializer(), tf.global_variables_initializer()))
 
-    for filepath in tf.gfile.Glob(os.path.join(input_dir, '*.jpg')):
+    for filepath in tf.gfile.Glob(os.path.join(input_dir, '*.JPEG')):
       image = imageio.imread(filepath)
       image = tf.image.convert_image_dtype(image, dtype=tf.float32)
       image = tf.expand_dims(image, [0])
+      image = tf.image.grayscale_to_rgb(tf.expand_dims(image, -1)) if sess.run(tf.rank(image)) == 3 else image
       image = tf.image.resize_bilinear(image, [height, width], align_corners=False)
       image = tf.squeeze(image, [0])
-      image = tf.subtract(image, 0.5)
-      image = tf.multiply(image, 2.0)
+#      image = tf.subtract(image, 0.5)
+#      image = tf.multiply(image, 2.0)
       image = sess.run(image)
 
       # Images for inception classifier are normalized to be in [-1, 1] interval.
@@ -116,7 +80,8 @@ def save_images(images, filenames, output_dir):
     output_dir: directory where to save images
   """
   for i,_ in enumerate(filenames):
-    img = (((images[i, :, :, :] + 1.0) * 0.5) * 255.0).astype(np.uint8)
+    # img = (((images[i, :, :, :] + 1.0) * 0.5) * 255.0).astype(np.uint8)
+    img = (images[i, :, :, :] * 255.0).astype(np.uint8)
     imageio.imwrite(os.path.join(output_dir, filenames[i]), img)
 
 def main(_):
@@ -156,76 +121,69 @@ def main(_):
     with tf.train.SessionManager().prepare_session(master=FLAGS.master, 
           checkpoint_filename_with_path=FLAGS.checkpoint_path, saver=saver) as sess:
 
+      # For Targeted Attacks
+      target_idx = 0 # This will vary
+      target = tf.constant(0, shape=[FLAGS.batch_size, num_classes])
+#      target = np.zeros((FLAGS.batch_size, num_classes), dtype=np.uint32)
+#      target[:, target] = 1
+      
       # Build Attack
       if FLAGS.attack_type.lower() == 'fgsm':
-        fgsm_opts = {'eps': 1/8.0, 'clip_min': -1., 'clip_max': 1.}
+        fgsm_opts = {'eps': 0.3, 'clip_min': 0, 'clip_max': 1., 'y_target': None}
         fgsm = FastGradientMethod(model)
         x_adv = fgsm.generate(x_input, **fgsm_opts)
       
       elif FLAGS.attack_type.lower() == 'bim':
-        bim_opts = {'eps': 1/8.0, 'eps_iter': 1/16.0, 'nb_iter': 5, 'clip_min': -1., 'clip_max': 1.}
+        bim_opts = {'eps': 0.3, 'clip_min': 0., 'clip_max': 1., 'y_target': None}
         bim = BasicIterativeMethod(model)
         x_adv = bim.generate(x_input, **bim_opts)
       
       elif FLAGS.attack_type.lower() == 'mim':
-        mim_opts = {'eps': 1/8.0, 'eps_iter': 1/16.0, 'nb_iter': 5, 'clip_min': -1., 'clip_max': 1.}
+        mim_opts = {'eps': 0.3, 'clip_min': 0, 'clip_max': 1.}
         mim = MomentumIterativeMethod(model)
         x_adv = mim.generate(x_input, **mim_opts)
       
+      elif FLAGS.attack_type.lower() == 'pgd':
+        pgd_opts = {'eps': 0.3, 'clip_min': 0, 'clip_max': 1.}
+        pgd = MadryEtAl(model)
+        x_adv = pgd.generate(x_input, **pgd_opts)
+
       # Broken
       elif FLAGS.attack_type.lower() == 'jsma':
-        jsma_opts = {'clip_min': -1., 'clip_max': 1.}
+        jsma_opts = {'theta': 1., 'gamma': 0.1, 'clip-min': 0., 'clip-max': 1., 'y_target': None}
         jsma = SaliencyMapMethod(model)
         x_adv = jsma.generate(x_input, **jsma_opts)
 
-      elif FLAGS.attack_type.lower() == 'vam':
-        vam_opts = {'eps': 1/8.0, 'clip_min': -1., 'clip_max': 1.}
-        vam = VirtualAdversarialMethod(model)
-        x_adv = vam.generate(x_input, **vam_opts)
-
-      elif FLAGS.attack_type.lower() == 'cwl2':
-        cwl2_opts = {'clip_min': -1., 'clip_max': 1.}
-        cwl2 = CarliniWagnerL2(model)
-        x_adv = cwl2.generate(x_input, **cwl2_opts)
-
-      elif FLAGS.attack_type.lower() == 'enm':
-        enm_opts = {'clip_min': -1., 'clip_max': 1.}
-        enm = ElasticNetMethod(model)
-        x_adv = enm.generate(x_input, **enm_opts)
-
-      elif FLAGS.attack_type.lower() == 'df':
-        df_opts = {'clip_min': -1., 'clip_max': 1.}
-        df = DeepFool(model)
-        x_adv = df.generate(x_input, **df_opts)
-
-      elif FLAGS.attack_type.lower() == 'madry':
-        madry_opts = {'eps': 1/8.0, 'eps_iter': 1/16.0, 'nb_iter': 5, 'clip_min': -1., 'clip_max': 1.}
-        madry = MadryEtAl(model)
-        x_adv = madry.generate(x_input, **madry_opts)
-
-      elif FLAGS.attack_type.lower() == 'spsa':
-        spsa_opts = {'epsilon': 1/8.0}
-        spsa = SPSA(CallableModelWrapper(model, 'probs'))
-        x_adv = spsa.generate(x_input, **spsa_opts)
+      elif FLAGS.attack_type.lower() == 'lbfgs':
+        lbfgs_opts = {'y_target': target}
+        lbfgs = LBFGS(model)
+        x_adv = lbfgs.generate(x_input, **lbfgs_opts)
 
       else:
         raise ValueError('Invalid attack type specified: {}'.format(FLAGS.attack_type))
 
-
+      start_time, batch_time, num_processed = time.time(), time.time(), 0
       for filenames, images in load_images(FLAGS.input_dir, batch_shape):
         adv_images = sess.run(x_adv, feed_dict={x_input: images})
         save_images(adv_images, filenames, FLAGS.output_dir)
 
-        preds = sess.run(model(np.float32(images)))
-        probs = np.amax(preds, axis=1)
-        classes = np.argmax(preds, axis=1)
-        adv_preds = sess.run(model(adv_images))
-        adv_probs = np.amax(adv_preds, axis=1)
-        adv_classes = np.argmax(adv_preds, axis=1)
+        if FLAGS.show_predictions:
+          preds = sess.run(model(np.float32(images)))
+          probs = np.amax(preds, axis=1)
+          classes = np.argmax(preds, axis=1)
+          adv_preds = sess.run(model(adv_images))
+          adv_probs = np.amax(adv_preds, axis=1)
+          adv_classes = np.argmax(adv_preds, axis=1)
 
-        for i,_ in enumerate(filenames):
-          print('\nOriginal: {:.2f}% ({})\nAdversarial: {:.2f}% ({})'.format( \
-            probs[i]*100, labels[str(classes[i])], adv_probs[i]*100, labels[str(adv_classes[i])]))
+          for i,_ in enumerate(filenames):
+            print('\nOriginal: {:.2f}% ({})\nAdversarial: {:.2f}% ({})'.format( \
+              probs[i]*100, labels[str(classes[i])], adv_probs[i]*100, labels[str(adv_classes[i])]))
+
+        time_delta = time.time() - batch_time
+        batch_time = time.time()
+        num_processed += len(filenames)
+        print('[SPEED ESTIMATION] BatchRate={:.4f} Hz; AverageRate={:.4f} Hz'.format( \
+          (len(filenames) / time_delta * 1.0), ((num_processed * 1.0) / (batch_time - start_time))))
 
 if __name__ == '__main__':
   tf.app.run()
